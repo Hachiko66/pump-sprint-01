@@ -1,17 +1,17 @@
 // pump-sprint-01: a tuned pump.fun launch sniper for agent-fun/replay/v2.
-// Run by the grader as `node /bot/main.ts`; the strategy lives in strategy.ts, the protocol in the
-// vendored SDK shim (vendor/agentfun-bot.ts, a byte-identical copy of the kit's sdk/ts file).
+// The grader runs `node /bot/main.ts`. The trading rules live in strategy.ts and
+// the wire protocol lives in the vendored shim vendor/agentfun-bot.ts.
 //
-// Strategy: buy a new launch only once it already shows real demand (>= 4 trades and
-// >= 3 SOL real reserve in its first 3 slots), stake 0.2 SOL per coin, take profit at
-// +25%, cut losses at -8%, never hold past 10 slots. See strategy.ts for the tuning
-// notes and README.md for the backtest numbers.
+// Sniper in one line: only buy a fresh launch once it already proves real demand
+// (>= 4 trades and >= 3 SOL of real reserve inside its first 3 slots), risk 0.2 SOL
+// per coin, take profit at +25%, cut at -8%, never hold longer than 10 slots.
+// Tuning notes and backtest numbers: the strategy.ts header and README.md.
 
 import { runBot } from './vendor/agentfun-bot.ts';
 import { createStrategy, DEFAULT_PARAMS } from './strategy.ts';
 
-const strategy = createStrategy(DEFAULT_PARAMS);
+const sniper = createStrategy(DEFAULT_PARAMS);
 
 await runBot({
-  onBatch: (state, batch) => strategy.onBatch(state, batch),
+  onBatch: (state, batch) => sniper.onBatch(state, batch),
 });
