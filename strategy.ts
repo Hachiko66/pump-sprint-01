@@ -1,4 +1,4 @@
-// Launch sniper with a rug filter, for agent-fun/replay/v2 (pump.fun bonding curves).
+// Selective launch sniper with a rug filter, for agent-fun/replay/v2 (pump.fun bonding curves).
 //
 // TUNED ENTRY (pump-sprint-01): this file starts from the kit pilot sniper
 // (baselines/pilot/sniper/strategy.ts) and ships the parameter set found by sweeping
@@ -157,14 +157,14 @@ export const DEFAULT_PARAMS: Params = {
   minPieceLamports: 2_000_000,
 };
 
-interface Tick {
+interface TapeTick {
   slot: number;
   isBuy: boolean;
   sol: bigint;
   user: Pubkey;
 }
 
-interface Coin {
+interface Tracked {
   mint: Pubkey;
   createSlot: number;
   creator: Pubkey;
@@ -180,7 +180,7 @@ interface Coin {
   devSold: boolean;
   lastTradeSlot: number;
   /** Trades of the last flowWindow slots (older ones dropped as new ones come). */
-  recent: Tick[];
+  recent: TapeTick[];
   buysSent: number;
   spentSent: bigint;
   /** Decision price (vq/vt as a pair) of the last buy sent. */
@@ -192,7 +192,7 @@ interface Coin {
   complete: boolean;
 }
 
-interface Held {
+interface OpenPos {
   openedSlot: number;
   txPaid: bigint;
   best: bigint;
@@ -204,21 +204,21 @@ export interface Strategy {
   onBatch(state: BotState, batch: Batch): OrderInput[];
 }
 
-const FEE_BPS = 125n;
+const CURVE_FEE_BPS = 125n;
 
 /** What selling `tokens` against (vq, vt) would pay after curve fees (protocol + creator, 95 + 30 bps). */
-function sellValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
+function exitValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
   if (tokens <= 0n || vt <= 0n) return 0n;
   const q = (tokens * vq) / (vt + tokens);
-  return q - (q * FEE_BPS + BPS - 1n) / BPS;
+  return q - (q * CURVE_FEE_BPS + BPS - 1n) / BPS;
 }
 
 export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
   const P = params;
-  const coins = new Map<Pubkey, Coin>();
-  const held = new Map<Pubkey, Held>();
+  const tracked = new Map<Pubkey, Tracked>();
+  const open = new Map<Pubkey, OpenPos>();
   /** Mints with a sell in flight. */
-  const selling = new Set<Pubkey>();
+  const exiting = new Set<Pubkey>();
   const stake = BigInt(P.stakeLamports);
   const minBuy = BigInt(P.minBuyLamports);
   let firstTime: number | null = null;
@@ -226,7 +226,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
   let filled = 0;
 
   /** How many pieces to split an order into now: baseSplit, more when the fill count lags its pace. */
-  function pieces(): number {
+  function splitCount(): number {
     if (firstTime === null) return P.baseSplit;
     const elapsed = Math.max(0, Math.min(P.windowSeconds, nowTime - firstTime));
     const due = (P.fillTarget * elapsed) / P.windowSeconds;
@@ -236,7 +236,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
   }
 
   /** Sell all of `tokens` as k orders in one reply. */
-  function sellOrders(mint: Pubkey, tokens: bigint, k: number, room: number): OrderInput[] {
+  function buildSellOrders(mint: Pubkey, tokens: bigint, k: number, room: number): OrderInput[] {
     const n = BigInt(Math.max(1, Math.min(k, room)));
     const out: OrderInput[] = [];
     const piece = tokens / n;
@@ -249,7 +249,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
   }
 
   /** Buy `amount` lamports as up to k orders in one reply (pieces of at least minPieceLamports). */
-  function buyOrders(mint: Pubkey, amount: bigint, k: number, room: number): OrderInput[] {
+  function buildBuyOrders(mint: Pubkey, amount: bigint, k: number, room: number): OrderInput[] {
     let n = BigInt(Math.max(1, Math.min(k, room)));
     const minPiece = BigInt(P.minPieceLamports);
     while (n > 1n && amount / n < minPiece) n -= 1n;
@@ -262,10 +262,10 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
     return out;
   }
 
-  function readEvents(batch: Batch): void {
+  function ingestEvents(batch: Batch): void {
     for (const e of batch.events) {
       if (e.event === 'CreateEvent') {
-        coins.set(e.mint, {
+        tracked.set(e.mint, {
           mint: e.mint,
           createSlot: e.slot,
           creator: e.creator,
@@ -289,7 +289,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           complete: false,
         });
       } else if (e.event === 'TradeEvent') {
-        const c = coins.get(e.mint);
+        const c = tracked.get(e.mint);
         if (c === undefined) continue;
         const sol = BigInt(e.sol_amount);
         c.trades += 1;
@@ -311,7 +311,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           }
         }
       } else {
-        const c = coins.get(e.mint);
+        const c = tracked.get(e.mint);
         if (c !== undefined) {
           c.complete = true;
           c.done = true;
@@ -321,7 +321,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
   }
 
   /** Net lamports bought minus sold and the distinct buyers, over the last flowWindow slots. */
-  function flow(c: Coin, slot: number): { net: bigint; buyers: number } {
+  function recentFlow(c: Tracked, slot: number): { net: bigint; buyers: number } {
     const from = slot - P.flowWindow;
     let drop = 0;
     while (drop < c.recent.length && c.recent[drop]!.slot <= from) drop++;
@@ -337,19 +337,36 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
     return { net, buyers: buyers.size };
   }
 
-  function hasPendingBuy(state: BotState, mint: Pubkey): boolean {
+  function buyInFlight(state: BotState, mint: Pubkey): boolean {
     for (const p of state.pending.values()) if (p.order.mint === mint && p.order.side === 'buy') return true;
     return false;
   }
 
-  function hasPendingSell(state: BotState, mint: Pubkey): boolean {
+  function sellInFlight(state: BotState, mint: Pubkey): boolean {
     for (const p of state.pending.values()) if (p.order.mint === mint && p.order.side === 'sell') return true;
+    return false;
+  }
+
+  /**
+   * Price-based exit signals (take-profit, stop-loss, trailing stop), as one boolean.
+   * A pure predicate over the position's current value, cost basis, best value seen and
+   * whether the first take-profit already fired; it changes nothing by itself. The three
+   * checks are the same ones the exit loop used inline, in the same order, combined with
+   * OR: any one of them means "exit now". Extracted so the exit loop reads as one line
+   * and the rule can be unit-tested on its own.
+   */
+  function priceExit(value: bigint, basis: bigint, best: bigint, tookTp1: boolean): boolean {
+    if (basis <= 0n) return false;
+    if (value * BPS >= basis * (BPS + BigInt(P.tpBps))) return true;
+    const sl = tookTp1 ? BigInt(P.slAfterTp1Bps) : BigInt(P.slBps);
+    if (value * BPS <= basis * (BPS - sl)) return true;
+    if (best * BPS >= basis * (BPS + BigInt(P.trailArmBps)) && value * BPS <= best * (BPS - BigInt(P.trailBps))) return true;
     return false;
   }
 
   return {
     onBatch(state, batch) {
-      readEvents(batch);
+      ingestEvents(batch);
       for (const e of batch.events) {
         if (e.block_time === null) continue;
         if (firstTime === null) firstTime = e.block_time;
@@ -363,32 +380,32 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
 
       for (const f of batch.fills) {
         if (f.client_id.startsWith('_')) {
-          held.delete(f.mint);
-          selling.delete(f.mint);
+          open.delete(f.mint);
+          exiting.delete(f.mint);
           continue;
         }
         if (f.status === 'filled') filled += 1;
-        const h = held.get(f.mint);
+        const h = open.get(f.mint);
         if (f.status !== 'rejected' && h !== undefined) h.txPaid += BigInt(f.tx_fee_lamports);
         if (f.side === 'buy' && f.status === 'filled' && h === undefined) {
-          held.set(f.mint, { openedSlot: f.slot, txPaid: BigInt(f.tx_fee_lamports), best: 0n, devSoldAtOpen: coins.get(f.mint)?.devSold ?? false, tookTp1: false });
+          open.set(f.mint, { openedSlot: f.slot, txPaid: BigInt(f.tx_fee_lamports), best: 0n, devSoldAtOpen: tracked.get(f.mint)?.devSold ?? false, tookTp1: false });
         }
       }
-      for (const mint of [...selling]) if (!hasPendingSell(state, mint)) selling.delete(mint);
-      for (const mint of [...held.keys()]) {
-        if (!state.positions.has(mint) && !selling.has(mint) && !hasPendingBuy(state, mint)) held.delete(mint);
+      for (const mint of [...exiting]) if (!sellInFlight(state, mint)) exiting.delete(mint);
+      for (const mint of [...open.keys()]) {
+        if (!state.positions.has(mint) && !exiting.has(mint) && !buyInFlight(state, mint)) open.delete(mint);
       }
-      const k = pieces();
+      const k = splitCount();
 
       // Exits first.
       for (const [mint, pos] of state.positions) {
         if (orders.length >= cap) break;
-        if (selling.has(mint)) continue;
-        const c = coins.get(mint);
-        let h = held.get(mint);
+        if (exiting.has(mint)) continue;
+        const c = tracked.get(mint);
+        let h = open.get(mint);
         if (h === undefined) {
           h = { openedSlot: state.slot, txPaid: tx, best: 0n, devSoldAtOpen: c?.devSold ?? false, tookTp1: false };
-          held.set(mint, h);
+          open.set(mint, h);
         }
         let mk = marks.get(mint);
         if (mk === undefined) {
@@ -396,7 +413,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           if (cv === undefined) continue;
           mk = { vq: cv.virtual_quote_reserves, vt: cv.virtual_token_reserves };
         }
-        const value = sellValue(pos.token_amount, mk.vq, mk.vt) - tx;
+        const value = exitValue(pos.token_amount, mk.vq, mk.vt) - tx;
         const basis = pos.cost_lamports + h.txPaid;
         if (value > h.best) h.best = value;
         let exit = false;
@@ -405,35 +422,32 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
             const part = (pos.token_amount * BigInt(P.tp1PartBps)) / BPS;
             if (part > 0n && part < pos.token_amount) {
               orders.push({ side: 'sell', mint, token_amount: part, max_slippage_bps: 10_000 });
-              selling.add(mint);
+              exiting.add(mint);
               h.tookTp1 = true;
               h.best = 0n;
               if (c !== undefined) c.done = true;
               continue;
             }
           }
-          if (value * BPS >= basis * (BPS + BigInt(P.tpBps))) exit = true;
-          const sl = h.tookTp1 ? BigInt(P.slAfterTp1Bps) : BigInt(P.slBps);
-          if (value * BPS <= basis * (BPS - sl)) exit = true;
-          if (h.best * BPS >= basis * (BPS + BigInt(P.trailArmBps)) && value * BPS <= h.best * (BPS - BigInt(P.trailBps))) exit = true;
+          if (priceExit(value, basis, h.best, h.tookTp1)) exit = true;
         }
         if (state.slot - h.openedSlot >= P.maxHold) exit = true;
         if (c !== undefined) {
           if (P.exitOnDevSell && c.devSold && !h.devSoldAtOpen) exit = true;
           if (state.slot - c.lastTradeSlot >= P.staleSlots) exit = true;
-          if (flow(c, state.slot).net < -BigInt(P.exitFlowLamports)) exit = true;
+          if (recentFlow(c, state.slot).net < -BigInt(P.exitFlowLamports)) exit = true;
         }
         if (!exit) continue;
-        orders.push(...sellOrders(mint, pos.token_amount, k, cap - orders.length));
-        selling.add(mint);
+        orders.push(...buildSellOrders(mint, pos.token_amount, k, cap - orders.length));
+        exiting.add(mint);
         if (c !== undefined) c.done = true;
       }
 
       // Entries and adds.
       let free = state.freeCashLamports() - tx * BigInt(orders.length);
       // Leave room in the reply for the split pieces of an exit next to new buys.
-      let open = state.committedPositionCount();
-      for (const c of coins.values()) {
+      let openCount = state.committedPositionCount();
+      for (const c of tracked.values()) {
         if (orders.length >= cap) break;
         if (c.done || c.complete) continue;
         const age = state.slot - c.createSlot;
@@ -445,8 +459,8 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         if (age < P.minAge) continue;
         if (isAdd) {
           if (c.buysSent > P.maxAdds) continue;
-          if (!state.positions.has(c.mint) || selling.has(c.mint) || hasPendingBuy(state, c.mint)) continue;
-        } else if (open >= state.hello.caps.max_open_positions) continue;
+          if (!state.positions.has(c.mint) || exiting.has(c.mint) || buyInFlight(state, c.mint)) continue;
+        } else if (openCount >= state.hello.caps.max_open_positions) continue;
         const curve = state.curves.get(c.mint);
         if (curve === undefined || curve.complete) continue;
         if (c.devSold && (P.skipDevSold || isAdd)) {
@@ -459,12 +473,12 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           // A second tranche once the launch has shown it is not an instant dump.
           if (state.slot - c.lastBuySlot < P.addDelay) continue;
           if (vq * c.lastBuyVt * BPS < c.lastBuyVq * vt * BigInt(10_000 + P.addStepBps)) continue;
-          if (flow(c, state.slot).net < BigInt(P.addMinFlowLamports)) continue;
+          if (recentFlow(c, state.slot).net < BigInt(P.addMinFlowLamports)) continue;
           const maxAdd = state.maxBuyLamports(c.mint);
           const want = BigInt(P.addLamports);
           const amount = want < maxAdd ? want : maxAdd;
           if (amount < minBuy || free < amount + tx * 6n) continue;
-          const add = buyOrders(c.mint, amount, k, cap - orders.length);
+          const add = buildBuyOrders(c.mint, amount, k, cap - orders.length);
           orders.push(...add);
           free -= amount + tx * BigInt(add.length);
           c.buysSent += 1;
@@ -483,7 +497,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         if (c.bigSellBps > BigInt(P.maxBigSellBps)) continue;
         const runup = (vq * c.vt0 * BPS) / (vt * c.vq0);
         if (runup > BigInt(P.maxRunupBps) || runup < BigInt(P.minRunupBps)) continue;
-        const fl = flow(c, state.slot);
+        const fl = recentFlow(c, state.slot);
         if (fl.net < BigInt(P.minFlowLamports) || fl.buyers < P.minRecentBuyers) continue;
         const room = stake - c.spentSent;
         if (room < minBuy) continue;
@@ -491,7 +505,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         const amount = room < maxBuy ? room : maxBuy;
         if (amount < minBuy) continue;
         if (free < amount + tx * 6n) continue;
-        const buys = buyOrders(c.mint, amount, k, cap - orders.length);
+        const buys = buildBuyOrders(c.mint, amount, k, cap - orders.length);
         orders.push(...buys);
         free -= amount + tx * BigInt(buys.length);
         c.buysSent += 1;
@@ -499,7 +513,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         c.lastBuyVq = vq;
         c.lastBuyVt = vt;
         c.lastBuySlot = state.slot;
-        open += 1;
+        openCount += 1;
       }
       return orders;
     },
