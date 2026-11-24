@@ -392,10 +392,10 @@ export interface PendingOrder {
   readonly decided_slot: number;
 }
 
-const U64_RE = /^(0|[1-9][0-9]{0,19})$/;
-const PUBKEY_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const U64_PATTERN = /^(0|[1-9][0-9]{0,19})$/;
+const ADDRESS_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 /** 1-64 of [A-Za-z0-9_-], not starting with `_`: ids starting with `_` are the harness's closes. */
-const CLIENT_ID_RE = /^[A-Za-z0-9-][A-Za-z0-9_-]{0,63}$/;
+const ORDER_ID_PATTERN = /^[A-Za-z0-9-][A-Za-z0-9_-]{0,63}$/;
 
 /**
  * Everything the bot knows, kept current by runBot before each callback. You can also drive it
@@ -417,8 +417,8 @@ export class BotState {
   readonly curves = new Map<Pubkey, Curve>();
   /** Orders sent and not yet reported in a fill, by client_id, in send order. */
   readonly pending = new Map<string, PendingOrder>();
-  #used = new Set<string>();
-  #next = 1;
+  #takenIds = new Set<string>();
+  #nextId = 1;
 
   constructor(hello: Hello) {
     this.hello = hello;
@@ -428,8 +428,8 @@ export class BotState {
 
   /** A fresh client_id (o1, o2, ...), never one already used in this run and never starting with `_`. */
   clientId(): string {
-    const id = this.#freeId(null);
-    this.#used.add(id);
+    const id = this.#freshId(null);
+    this.#takenIds.add(id);
     return id;
   }
 
@@ -471,11 +471,11 @@ export class BotState {
     this.seq = batch.seq;
     this.slot = batch.slot;
     for (const f of batch.fills) this.pending.delete(f.client_id);
-    this.#setAccount(batch.account);
+    this.#applyAccount(batch.account);
     for (const m of batch.marks) {
       const c = this.curves.get(m.mint);
       if (c !== undefined && m.slot < c.reserves_slot) continue;
-      const curve = c ?? this.#newCurve(m.mint, null, m.slot);
+      const curve = c ?? this.#makeCurve(m.mint, null, m.slot);
       curve.virtual_token_reserves = BigInt(m.virtual_token_reserves);
       curve.virtual_quote_reserves = BigInt(m.virtual_quote_reserves);
       curve.real_token_reserves = BigInt(m.real_token_reserves);
@@ -484,13 +484,13 @@ export class BotState {
     }
     for (const e of batch.events) {
       if (e.event === 'CreateEvent') {
-        const curve = this.#newCurve(e.mint, e.slot, e.slot);
+        const curve = this.#makeCurve(e.mint, e.slot, e.slot);
         curve.virtual_token_reserves = BigInt(e.virtual_token_reserves);
         curve.virtual_quote_reserves = BigInt(e.virtual_quote_reserves);
         curve.real_token_reserves = BigInt(e.real_token_reserves);
         curve.real_quote_reserves = 0n;
       } else if (e.event === 'TradeEvent') {
-        const curve = this.curves.get(e.mint) ?? this.#newCurve(e.mint, null, e.slot);
+        const curve = this.curves.get(e.mint) ?? this.#makeCurve(e.mint, null, e.slot);
         curve.virtual_token_reserves = BigInt(e.virtual_token_reserves);
         curve.virtual_quote_reserves = BigInt(e.virtual_quote_reserves);
         curve.real_token_reserves = BigInt(e.real_token_reserves);
@@ -498,7 +498,7 @@ export class BotState {
         curve.reserves_slot = e.slot;
         curve.trades += 1;
       } else {
-        const curve = this.curves.get(e.mint) ?? this.#newCurve(e.mint, null, e.slot);
+        const curve = this.curves.get(e.mint) ?? this.#makeCurve(e.mint, null, e.slot);
         curve.complete = true;
       }
     }
@@ -507,7 +507,7 @@ export class BotState {
   /** Fold the final account in. runBot calls this before onDone. */
   applyDone(done: Done): void {
     this.seq = done.seq;
-    this.#setAccount(done.account);
+    this.#applyAccount(done.account);
   }
 
   /**
@@ -517,7 +517,7 @@ export class BotState {
    */
   toOrders(result: unknown): Order[] {
     if (result === undefined || result === null) return [];
-    if (!Array.isArray(result)) throw new OrderError(`batch ${this.seq}: onBatch must return an array of orders, got ${describe(result)}`);
+    if (!Array.isArray(result)) throw new OrderError(`batch ${this.seq}: onBatch must return an array of orders, got ${describeValue(result)}`);
     const cap = this.hello.caps.max_orders_per_batch;
     if (result.length > cap) {
       throw new OrderError(
@@ -525,11 +525,11 @@ export class BotState {
           `the harness rejects the orders past the cap and fails the run on a reply far over it, so send at most ${cap} per batch`,
       );
     }
-    const checked = result.map((o: unknown, i: number) => checkOrder(o, `batch ${this.seq} order ${i}`));
+    const checked = result.map((o: unknown, i: number) => validateOrder(o, `batch ${this.seq} order ${i}`));
     const taken = new Set<string>();
     for (const o of checked) if (o.client_id !== undefined) taken.add(o.client_id);
     return checked.map((o) => {
-      const client_id = o.client_id ?? this.#freeId(taken);
+      const client_id = o.client_id ?? this.#freshId(taken);
       taken.add(client_id);
       return o.side === 'buy'
         ? { side: 'buy', client_id, mint: o.mint, quote_lamports: o.amount, max_slippage_bps: o.max_slippage_bps }
@@ -540,19 +540,19 @@ export class BotState {
   /** Record orders as sent on the current batch: they stay in `pending` until their fill arrives. */
   recordOrders(orders: readonly Order[]): void {
     for (const order of orders) {
-      this.#used.add(order.client_id);
+      this.#takenIds.add(order.client_id);
       this.pending.set(order.client_id, { order, seq: this.seq, decided_slot: this.slot });
     }
   }
 
-  #freeId(taken: Set<string> | null): string {
+  #freshId(taken: Set<string> | null): string {
     for (;;) {
-      const id = `o${this.#next++}`;
-      if (!this.#used.has(id) && (taken === null || !taken.has(id))) return id;
+      const id = `o${this.#nextId++}`;
+      if (!this.#takenIds.has(id) && (taken === null || !taken.has(id))) return id;
     }
   }
 
-  #newCurve(mint: Pubkey, created: number | null, slot: number): Curve {
+  #makeCurve(mint: Pubkey, created: number | null, slot: number): Curve {
     const curve: Curve = {
       mint,
       created_slot: created,
@@ -568,7 +568,7 @@ export class BotState {
     return curve;
   }
 
-  #setAccount(account: Account): void {
+  #applyAccount(account: Account): void {
     this.account = account;
     this.cash = BigInt(account.cash_lamports);
     this.positions.clear();
@@ -579,7 +579,7 @@ export class BotState {
   }
 }
 
-interface CheckedOrder {
+interface ValidatedOrder {
   side: Side;
   client_id: string | undefined;
   mint: Pubkey;
@@ -587,28 +587,28 @@ interface CheckedOrder {
   max_slippage_bps: number;
 }
 
-const BUY_KEYS = new Set(['side', 'client_id', 'mint', 'quote_lamports', 'max_slippage_bps']);
-const SELL_KEYS = new Set(['side', 'client_id', 'mint', 'token_amount', 'max_slippage_bps']);
+const BUY_FIELDS = new Set(['side', 'client_id', 'mint', 'quote_lamports', 'max_slippage_bps']);
+const SELL_FIELDS = new Set(['side', 'client_id', 'mint', 'token_amount', 'max_slippage_bps']);
 
-function checkOrder(value: unknown, where: string): CheckedOrder {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new OrderError(`${where}: expected an order object, got ${describe(value)}`);
+function validateOrder(value: unknown, where: string): ValidatedOrder {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new OrderError(`${where}: expected an order object, got ${describeValue(value)}`);
   const o = value as Record<string, unknown>;
-  if (o.side !== 'buy' && o.side !== 'sell') throw new OrderError(`${where}: side must be "buy" or "sell", got ${describe(o.side)}`);
-  const allowed = o.side === 'buy' ? BUY_KEYS : SELL_KEYS;
+  if (o.side !== 'buy' && o.side !== 'sell') throw new OrderError(`${where}: side must be "buy" or "sell", got ${describeValue(o.side)}`);
+  const allowed = o.side === 'buy' ? BUY_FIELDS : SELL_FIELDS;
   for (const k of Object.keys(o)) {
     if (!allowed.has(k)) throw new OrderError(`${where}: unknown key "${k}" on a ${o.side} order`);
   }
-  if (typeof o.mint !== 'string' || !PUBKEY_RE.test(o.mint)) throw new OrderError(`${where}: mint must be a base58 address, got ${describe(o.mint)}`);
+  if (typeof o.mint !== 'string' || !ADDRESS_PATTERN.test(o.mint)) throw new OrderError(`${where}: mint must be a base58 address, got ${describeValue(o.mint)}`);
   const amountKey = o.side === 'buy' ? 'quote_lamports' : 'token_amount';
   const amount = toU64(o[amountKey], `${where}: ${amountKey}`);
   const bps = o.max_slippage_bps;
   if (typeof bps !== 'number' || !Number.isInteger(bps) || bps < 0 || bps > 10_000) {
-    throw new OrderError(`${where}: max_slippage_bps must be an integer 0..10000, got ${describe(bps)}`);
+    throw new OrderError(`${where}: max_slippage_bps must be an integer 0..10000, got ${describeValue(bps)}`);
   }
   let client_id: string | undefined;
   if (o.client_id !== undefined) {
-    if (typeof o.client_id !== 'string' || !CLIENT_ID_RE.test(o.client_id)) {
-      throw new OrderError(`${where}: client_id must be 1-64 of [A-Za-z0-9_-] not starting with _ (reserved for the harness's closes), got ${describe(o.client_id)}`);
+    if (typeof o.client_id !== 'string' || !ORDER_ID_PATTERN.test(o.client_id)) {
+      throw new OrderError(`${where}: client_id must be 1-64 of [A-Za-z0-9_-] not starting with _ (reserved for the harness's closes), got ${describeValue(o.client_id)}`);
     }
     client_id = o.client_id;
   }
@@ -620,14 +620,14 @@ export function toU64(value: unknown, what = 'amount'): U64 {
   let n: bigint | null = null;
   if (typeof value === 'bigint') n = value;
   else if (typeof value === 'number' && Number.isSafeInteger(value)) n = BigInt(value);
-  else if (typeof value === 'string' && U64_RE.test(value)) n = BigInt(value);
+  else if (typeof value === 'string' && U64_PATTERN.test(value)) n = BigInt(value);
   if (n === null || n < 0n || n > U64_MAX) {
-    throw new OrderError(`${what} must be a u64 (bigint, decimal string or safe integer), got ${describe(value)}`);
+    throw new OrderError(`${what} must be a u64 (bigint, decimal string or safe integer), got ${describeValue(value)}`);
   }
   return n.toString();
 }
 
-function describe(value: unknown): string {
+function describeValue(value: unknown): string {
   if (typeof value === 'bigint') return `${value}n`;
   if (typeof value === 'string') return JSON.stringify(value.length > 80 ? `${value.slice(0, 77)}...` : value);
   if (value === null || typeof value !== 'object') return String(value);
@@ -745,13 +745,13 @@ export async function runBot(bot: Bot, io: BotIO = {}): Promise<RunResult> {
     if (type === 'hello') {
       const hello = msg as Hello;
       if (state !== null) throw new ProtocolError(`input line ${lineNo}: a second hello`);
-      if (hello.protocol !== PROTOCOL) throw new ProtocolError(`the harness speaks ${describe(hello.protocol)}; this shim speaks ${PROTOCOL}`);
+      if (hello.protocol !== PROTOCOL) throw new ProtocolError(`the harness speaks ${describeValue(hello.protocol)}; this shim speaks ${PROTOCOL}`);
       state = new BotState(hello);
       await bot.onHello?.(state);
     } else if (type === 'batch') {
       const batch = msg as Batch;
       if (state === null) throw new ProtocolError(`input line ${lineNo}: a batch before hello`);
-      checkBatch(batch, lineNo);
+      validateBatch(batch, lineNo);
       state.applyBatch(batch);
       const orders = state.toOrders(await bot.onBatch(state, batch));
       const reply: Reply = { type: 'reply', seq: batch.seq, orders };
@@ -761,7 +761,7 @@ export async function runBot(bot: Bot, io: BotIO = {}): Promise<RunResult> {
         throw new OrderError(`batch ${batch.seq}: the reply is ${bytes} bytes (max ${MAX_BOT_LINE_BYTES}); send fewer orders (caps.max_orders_per_batch is ${state.hello.caps.max_orders_per_batch})`);
       }
       state.recordOrders(orders);
-      await writeLine(output, `${text}\n`);
+      await sendLine(output, `${text}\n`);
       batches++;
     } else if (type === 'done') {
       const done = msg as Done;
@@ -770,13 +770,13 @@ export async function runBot(bot: Bot, io: BotIO = {}): Promise<RunResult> {
       await bot.onDone?.(state, done);
       return { state, done, batches };
     } else {
-      throw new ProtocolError(`input line ${lineNo}: unknown message type ${describe(type)}`);
+      throw new ProtocolError(`input line ${lineNo}: unknown message type ${describeValue(type)}`);
     }
   }
   throw new ProtocolError(state === null ? 'input ended before hello' : `input ended before done (after ${batches} batches)`);
 }
 
-function checkBatch(batch: Batch, lineNo: number): void {
+function validateBatch(batch: Batch, lineNo: number): void {
   const ok =
     Number.isSafeInteger(batch.seq) &&
     Number.isSafeInteger(batch.slot) &&
@@ -789,7 +789,7 @@ function checkBatch(batch: Batch, lineNo: number): void {
   if (!ok) throw new ProtocolError(`input line ${lineNo}: malformed batch`);
 }
 
-function writeLine(output: LineWriter, text: string): Promise<void> | void {
+function sendLine(output: LineWriter, text: string): Promise<void> | void {
   const ok = output.write(text);
   if (ok === false && typeof output.once === 'function') {
     const once = output.once.bind(output);
